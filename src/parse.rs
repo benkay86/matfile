@@ -1,18 +1,17 @@
 use libflate::zlib::Decoder;
-use nom::number::Endianness;
+use nom::branch::alt;
+use nom::bytes::complete::{is_not, tag, take};
+use nom::combinator::{map, map_parser, map_res, peek, value, verify};
 use nom::number::complete::{
     be_f32, be_f64, be_i16, be_i32, be_i64, be_i8, be_u16, be_u32, be_u64, be_u8, le_f32, le_f64,
     le_i16, le_i32, le_i64, le_i8, le_u16, le_u32, le_u64, le_u8,
 };
+use nom::number::Endianness;
+use nom::sequence::pair;
 use nom::{
     alt, call, char, complete, cond, count, do_parse, error_position, i32, length_value, many0,
-    map, map_res, not, opt, pair, peek, switch, tag, take, u16, u32, value, IResult,
-    try_parse,
+    map, map_res, not, opt, pair, peek, switch, tag, take, try_parse, u16, u32, value, IResult,
 };
-use nom::combinator::{peek, map, map_parser, map_res, verify, value};
-use nom::bytes::complete::{take, is_not, tag};
-use nom::sequence::pair;
-use nom::branch::alt;
 use num_traits::FromPrimitive;
 use std::io::Read;
 
@@ -22,7 +21,7 @@ use std::io::Read;
 #[derive(Clone, Debug)]
 pub struct Header {
     text: String,
-    endian: Endianness,
+    endianness: Endianness,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -120,84 +119,50 @@ fn assert(i: &[u8], v: bool) -> IResult<&[u8], ()> {
     }
 }
 
-/// Parser that does not do anything.
-/// Useful as a placeholder, e.g.
-///
-/// ```ignore
-/// let the_answer = 42;
-/// nom::combinator::verify(null_parser, |_| the_answer == 42)?; 
-/// ```
-fn null_parser(i: &[u8]) -> IResult<&[u8], ()> {
-    Ok((i, ()))
-}
-
 pub fn parse_header(i: &[u8]) -> IResult<&[u8], Header> {
     // Make sure first 4 bytes are not null, but do not consume those bytes.
     let (i, _) = peek(map_parser(take(4usize), is_not("\0")))(i)?;
-    
+
     // Consume 116 byte text field, which starts at beginning of file.
     // The text should be valid utf8.
     let (i, text) = map_res(take(116usize), std::str::from_utf8)(i)?;
-    
-    // Consume 8 byte subsystem data offset, but we don't use it for anything.
-    let (i, _ssdo) = take(8usize)(i)?; 
-    
-    // The next 4 bytes are a u16 version and then either "IM" or "MI".
-    // If we get "IM" then the file was written on a little endian machine.
-    // If it's "MI" then the file was written on a big endian machine.
-    // The parse `le_u16` will parse the version assuming it is little endian.
-    // If in fact we get "MI" and the file is big endian we must swap the bytes
-    // in version.
-        
-//// Alternative 1 ////
-    
-    // Extract (assumed little endian) version number and endianness indicator
-    // as a pair/tuple. 
-    let (i, (version, endian)) = pair(le_u16, alt((
-        // If "IM" then file was written on a little endian machine.
-        value(Endianness::Little, tag("IM")),
-        // If "MI" then file was written on a big endian machine.
-        value(Endianness::Big, tag("MI"))
-    )))(i)?;
-    
-    // If the file was little endian then the version number was parsed
-    // correctly with `le_u16`.  If it was actually big endian then we need to
-    // swap the bytes.
-    let version = match endian {
-        Endianness::Little => version,
-        Endianness::Big => version.swap_bytes()
-    };
-    
-    // Verify the the version number is equal to 0x0100.
-    verify(null_parser, |_| version == 0x0100 )(i)?;
-    
-//// Alternative 2 ////
 
-    let (i, (_version, endian)) = verify(map(
-        // Extract the version and endianness as a pair/tuple.
-        pair(/* version -> */ le_u16, /* endianness -> */ alt((
+    // Consume 8 byte subsystem data offset, but we don't use it for anything.
+    let (i, _ssdo) = take(8usize)(i)?;
+
+    // The next 4 bytes are a u16 version and a 2 byte endianness indicator.
+    // We read the version field under the assumption that it is little endian
+    // encoded. If this assumption turns out to be wrong after checking the
+    // file endianness indicator, we swap the bytes of the version field.
+    let (i, (version, endianness)) = pair(
+        /* version -> */ le_u16,
+        /* endianness -> */
+        alt((
             // If "IM" then file was written on a little endian machine.
             value(Endianness::Little, tag("IM")),
             // If "MI" then file was written on a big endian machine.
-            value(Endianness::Big, tag("MI"))
-        ))),
-        // map() version from file endianness to native endianness.
-        | (version, endian) | {
-            match endian {
-                Endianness::Little => (version, endian),
-                Endianness::Big => (version.swap_bytes(), endian)
-            }
-        }),
-        // verify() version is equal to 0x0100.
-        | (version, _) | version == &0x0100 )(i)?;
-    
-//// End of Alternatives ////
-    
-    // Return the remaining input `i` and the header.    
-    Ok((i, Header {
-        text: text.into(),
-        endian: endian,
-    }))
+            value(Endianness::Big, tag("MI")),
+        )),
+    )(i)?;
+    // Swap the bytes of the version field if the file is actually big endian
+    let version = if endianness == Endianness::Big {
+        version.swap_bytes()
+    } else {
+        version
+    };
+    // The version should be equal to 0x0100.
+    if version != 0x0100 {
+        return Err(nom::Err::Error((i, nom::error::ErrorKind::Verify)));
+    }
+
+    // Return the remaining input `i` and the header.
+    Ok((
+        i,
+        Header {
+            text: text.into(),
+            endianness: endianness,
+        },
+    ))
 }
 
 fn parse_next_data_element(
@@ -446,7 +411,10 @@ fn parse_array_flags_subelement(
     )
 }
 
-fn parse_matrix_data_element(i: &[u8], endianness:  nom::number::Endianness) -> IResult<&[u8], DataElement> {
+fn parse_matrix_data_element(
+    i: &[u8],
+    endianness: nom::number::Endianness,
+) -> IResult<&[u8], DataElement> {
     do_parse!(
         i,
         flags: call!(parse_array_flags_subelement, endianness)
@@ -638,7 +606,7 @@ fn parse_numeric_matrix_subelements(
 
 fn parse_sparse_matrix_subelements(
     i: &[u8],
-    endianness:  nom::number::Endianness,
+    endianness: nom::number::Endianness,
     flags: ArrayFlags,
 ) -> IResult<&[u8], DataElement> {
     // Figure out the type of array
@@ -677,7 +645,7 @@ fn parse_sparse_matrix_subelements(
 
 fn parse_row_index_array_subelement(
     i: &[u8],
-    endianness:  nom::number::Endianness,
+    endianness: nom::number::Endianness,
 ) -> IResult<&[u8], RowIndex> {
     do_parse!(
         i,
@@ -699,7 +667,7 @@ fn parse_row_index_array_subelement(
 
 fn parse_column_index_array_subelement(
     i: &[u8],
-    endianness:  nom::number::Endianness,
+    endianness: nom::number::Endianness,
 ) -> IResult<&[u8], ColumnShift> {
     do_parse!(
         i,
@@ -747,7 +715,7 @@ pub fn parse_all(i: &[u8]) -> IResult<&[u8], ParseResult> {
     do_parse!(
         i,
         header: parse_header
-            >> endianness: value!(header.endian)
+            >> endianness: value!(header.endianness)
             >> data_elements: many0!(complete!(call!(parse_next_data_element, endianness)))
             >> (ParseResult {
                 header: header,
@@ -766,7 +734,7 @@ mod test {
 
         let (_, parsed_data) = parse_all(data).unwrap();
         let parsed_matrix_data = parsed_data.data_elements[0].clone();
-        if let DataElement::SparseMatrix(flags, dim, name, irows, icols, real_vals, imag_vals) =
+        if let DataElement::SparseMatrix(_flags, dim, _name, irows, icols, real_vals, imag_vals) =
             parsed_matrix_data
         {
             assert_eq!(dim, vec![8, 8]);
@@ -788,7 +756,7 @@ mod test {
 
         let (_, parsed_data) = parse_all(data).unwrap();
         let parsed_matrix_data = parsed_data.data_elements[0].clone();
-        if let DataElement::SparseMatrix(flags, dim, name, irows, icols, real_vals, imag_vals) =
+        if let DataElement::SparseMatrix(_flags, dim, _name, irows, icols, real_vals, imag_vals) =
             parsed_matrix_data
         {
             assert_eq!(dim, vec![8, 8]);
